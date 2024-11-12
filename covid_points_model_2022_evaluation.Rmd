@@ -1,0 +1,187 @@
+---
+title: Points Model 2022 Evaluation (#2/2)
+author: "Yatir Ben Shlomo"
+output: 
+  html_document:
+    toc: false
+    toc_depth: 3
+    toc_float: hide
+date: "`r format(Sys.time(), '%H:%M %d %B %Y')`"
+params:
+  outcome_col_name: first_time_severe
+  plot_hists: 0
+  sanity_tests: 1
+  seed: 2013
+  debug_mode: 1
+  train_prop: 0.8
+  prevent_negative_scores: 1
+
+---
+
+## parameters:
+  * outcome columns =  `r params$outcome_col_name`\
+  * outcome = `r ifelse (params$outcome_col_name == 'first_time_severe' , 'Severe or Death', 'Hospitalizaiton')` 
+  * train_prop = `r params$train_prop`\ 
+  * prevent_negative_scores = `r params$prevent_negative_scores` 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+library(plyr)
+library(tidyverse)
+library(RODBC)
+library(dbplyr)
+library(mgcv)
+library(gtsummary)
+library(ggplot2)
+library(MatchIt)
+library(Hmisc)
+library(readxl)
+library(glue)
+library(dplyr)
+library(feather)
+library(cobalt)
+library(knitr)
+library(cri.utils)
+library(lubridate)
+library(jtools)
+library(flextable)
+library(formula.tools)
+library(fastDummies) # to create dummy columns
+library(pROC)
+source('functions.R')
+
+```
+
+
+```{r include=FALSE}
+options(scipen = 999)
+activate_keytab("yatirbe")
+set.seed(params$seed)
+```
+
+
+```{r read data}
+load(file = "glm_fit.rda")
+data_train = read_feather("feathers/data_train.feather")
+data_test  = read_feather("feathers/data_test.feather")
+```
+
+
+
+```{r}
+
+```
+
+### observations in the train_set: `r nrow(data_train)`
+### observations in the test_set: `r nrow(data_test)`
+```{r}
+ref_var = get_normalization_factor(glm_fit)
+normalization_factor = ref_var[[2]]
+```
+
+#### multiplying all coefficients by 1/`r normalization_factor` 
+reference variable: `r ref_var[[1]]`
+
+```{r}
+# 1. Full model
+raw_scores = get_scores(glm_fit, ref_var_value = 1.0,
+                        simplification_factor = 1.0,
+                        normalization_factor = normalization_factor)
+                      
+```
+
+```{r message=FALSE, warning=FALSE}
+
+train_metrics = calc_metrics(data_train, add_observed_risk=F,glm_fit,raw_scores)
+min_possible_score = (train_metrics$min_negative_points)
+points_df = get_points_model(raw_scores, min_possible_score)
+
+
+# 2. Simplified model
+simplified_scores = get_scores(glm_fit, ref_var_value = 1.0,
+                        simplification_factor = 3.0,
+                        normalization_factor = normalization_factor)
+
+simplified_train_metrics = calc_metrics(data_train, add_observed_risk=F,glm_fit,simplified_scores)
+simplified_min_possible_score = (simplified_train_metrics$min_negative_points)
+simplified_points_df = get_points_model(simplified_scores, simplified_min_possible_score)
+
+
+
+# 3. side by side description of the full and simplified points model:
+ points_models = points_df %>% 
+   inner_join(simplified_points_df, by = "var") %>% 
+   rename(`Simplified Points` = points.y,
+           `Original Points` = points.x,
+          Variable = var) %>% 
+   select(Variable, `Original Points`, `Simplified Points`)
+  
+ write_csv(points_models, "points_models.csv")
+```
+```{r}
+points_models %>% 
+  kable()
+```
+
+
+```{r}
+# 4. Full model evaluation metrics  
+full_metrics = calc_metrics(data_test, add_observed_risk=F,glm_fit,raw_scores)
+
+test_set_metrics = full_metrics$metrics %>% 
+  mutate(across(contains('risk') | contains('%pop') ,function(x) glue("{x}%"))) %>% 
+  select(points, min_pred_risk, max_pred_risk, `%pop_>=`, sensitivity, PPV, lift) %>% 
+  rename(`min predicted risk` = min_pred_risk,
+         `max predicted risk` = max_pred_risk,
+         `% population not below` = `%pop_>=`)
+
+
+write_csv(test_set_metrics,  glue("test_set_metrics.csv"))
+
+# 5. simplified model evaluation metrics  
+
+simplified_metrics = calc_metrics(data_test, add_observed_risk=F, glm_fit, simplified_scores)
+
+simplified_test_set_metrics = simplified_metrics$metrics %>% 
+  mutate(across(contains('risk') | contains('%pop') ,function(x) glue("{x}%"))) %>% 
+  select(points, min_pred_risk, max_pred_risk, `%pop_>=`, sensitivity, PPV, lift) %>% 
+  rename(`min predicted risk` = min_pred_risk,
+         `max predicted risk` = max_pred_risk,
+         `% population not below` = `%pop_>=`)
+
+write_csv(simplified_test_set_metrics,  glue("simplified_test_set_metrics.csv"))
+
+```
+
+
+
+#### Creating a nice table of the metrics
+```{r}
+test_set_metrics %>% 
+  mutate(pop = `% population not below` ) %>% 
+  mutate(pop = str_sub(pop, 1,-2) )%>% 
+  transform(pop = as.numeric(pop)) %>% 
+  filter(points %in% c(27,31,35,39,41,43,46,51,55)) %>% 
+  select (lift,PPV, sensitivity     , pop, points) %>% 
+  mutate(sensitivity = 100*sensitivity) %>% 
+  mutate(PPV = 100*PPV) %>% 
+  mutate(across(where(is.numeric),~round(.x, 1))) %>% 
+  mutate(across(c('pop', 'lift'),~round(.x, 0))) %>% 
+  mutate(across(c('sensitivity', 'PPV'),~ sprintf(.x, fmt = '%#.1f%%'))) %>%  
+  mutate(across(c('pop'),~ sprintf(.x, fmt = '%d%%'))) %>% 
+  arrange(desc(points)) %>% 
+  write_csv(glue("test_set_metrics_for PPT.csv"))
+```
+
+
+---
+
+# Full model Test set AUC: `r full_metrics$auc`
+# simplified model Test set AUC: `r simplified_metrics$auc`
+
+
+

@@ -1,0 +1,592 @@
+---
+title: Points Model
+output: 
+  html_document:
+    toc: false
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+date: "`r format(Sys.time(), '%H:%M %d %B %Y')`"
+params:
+  min_age: 18
+  input_table: covid_points_model_population_2021_12_25__2022_03_16_no_pax
+
+  outcome_col_name: first_time_severe
+  create_tables: 1
+  plot_hists: 0
+  sanity_tests: 1
+  fwp_window: 21
+  calc_broom_fit_ci: 1
+  filter_missing_bmi: 0
+  seed: 2013
+  debug_mode: 1
+  train_prop: 0.8
+  remove_paxlovid_takers: 1
+
+---
+
+## parameters:
+  * input_table =  `r params$input_table`\
+  * min_age =  `r params$min_age`\
+  * outcome columns =  `r params$outcome_col_name`\
+  * outcome = `r ifelse (params$outcome_col_name == 'first_time_severe' , 'Severe or Death', 'Hospitalizaiton ? ')` 
+  * fwp_window = `r params$fwp_window` days \
+  * calc_broom_fit_ci = `r params$calc_broom_fit_ci`\
+  * train_prop = `r params$train_prop`\ 
+  * filter_missing_bmi: `r params$filter_missing_bmi`\
+  * remove_paxlovid_takers: `r params$remove_paxlovid_takers`\
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# 
+ library(plyr)
+ library(tidyverse)
+ library(RODBC)
+ library(mgcv)
+ library(gtsummary)
+ library(ggplot2)
+ library(MatchIt)
+ library(Hmisc)
+ library(readxl)
+ library(glue)
+ library(dplyr)
+ library(feather)
+ library(cobalt)
+ library(knitr)
+ library(cri.utils)
+ library(lubridate)
+ library(jtools)
+ library(flextable)
+ library(formula.tools)
+ library(fastDummies) # to create dummy columns
+ library(pROC)
+ source('functions.R')
+ library(dbplyr)
+```
+
+
+```{r include=FALSE}
+options(scipen = 999)
+activate_keytab("innovationdev1")
+set.seed(params$seed)
+
+```
+
+```{r include=FALSE}
+con <- cri_connection()
+
+
+```
+
+
+```{r read sql,  include=FALSE}
+filename = glue("feathers/{params$input_table}.feather")
+if (file.exists(filename)) {
+  df_raw = read_feather (filename)
+} else {
+df_raw = connect_table(con, "Mechkar.[clalit\\yatirbe]", params$input_table) %>%
+  select(-teudat_zehut, -t_index_date) %>%
+  mutate(index_date = positive_date) %>% 
+  rename(date_ptria_corona = covid_death_date) %>% 
+  rename(sw_previous_infection = sw_reinfection) %>% 
+  distinct() %>%
+  collect()
+write_feather(df_raw, filename)
+}
+```
+
+
+
+First PCR Positive date: `r min(df_raw$index_date) `
+Last PCR Positive date: `r max(df_raw$index_date) `
+
+
+
+```{r eval=FALSE, include=FALSE}
+describe(df_raw)
+```
+
+
+```{r initial cleaning, echo=FALSE}
+df_raw = df_raw %>%
+  dplyr::mutate(psw_nursing_home = replace_na(psw_nursing_home, 0)) %>%
+  dplyr::mutate(age = pn_age) %>%
+  dplyr::mutate(sex = factor(sex)) %>% 
+  dplyr::mutate(sex = fct_relevel(sex, 'F','M')) %>%
+  dplyr::mutate(days_from_dose_1 =  ifelse(days_from_dose_1 < 0, as.numeric(NA_integer_),days_from_dose_1)) %>% 
+  print_total("")
+  
+
+```
+
+```{r sanity on dose1 date, echo=FALSE}
+num_invalid_dose1_date =  df_raw %>%
+  filter(days_from_dose_1 < 0) %>% 
+  select(days_from_dose_1) %>%
+  dplyr::summarise(n=dplyr::n()) %>% 
+  pull(n)
+
+stopifnot(params$sanity_tests == 0 || num_invalid_dose1_date ==0)
+```
+
+
+```{r age and membership filtering, echo=FALSE}
+  df = df_raw %>%
+  print_total("before age filtering") %>% 
+    filter(between(age, params$min_age, 150)) %>% 
+  print_total("after age filtering") %>% 
+  filter(sw_cont_membership == 1) %>%
+  print_total("after cont. membership filtering") 
+
+```
+```{r paxlovid filtering, echo=FALSE}  
+if (params$remove_paxlovid_takers == 1) {
+  df = df %>% 
+  filter(pax_taker == 0 ) %>%
+  print_total("after filtering Paxlovid takers")
+} else {
+  print("Avoding the removal of paxlovid takes")
+}
+```
+
+```{r echo=FALSE}
+if (params$debug_mode == 1){
+  
+  df %>%
+    filter(first_time_severe < index_date) %>%
+    select(index_date, first_time_severe )
+}
+```
+
+
+
+```{r time to outcome calc, echo=FALSE}
+fwp_end_date =  max(as.Date((df_raw$retrieval_date)))
+df = df %>%
+ mutate(days_to_end_of_fwp = as.numeric(difftime(fwp_end_date, index_date, units = "days"))) 
+ 
+```
+
+```{r time to outcome , echo=FALSE}
+if (params$plot_hists == 1) {
+hist(df$days_to_end_of_fwp, breaks=40, freq=F)
+}
+```
+
+```{r}
+if (params$plot_hists == 1) {
+  tmp = df %>%
+    filter(pn_count_hosp>3)
+hist(tmp$pn_count_hosp, breaks=30, freq=T,xlim =c(0,20), main = "hist of pn_count_hosp when > 3")
+}
+
+
+```
+```{r}
+if (params$plot_hists == 1) {
+  N = nrow(df)
+ df %>% 
+    group_by(pn_count_hosp) %>% 
+    count() %>% 
+    arrange(pn_count_hosp) %>% 
+    mutate(percent = 100*round(cumsum(n)/N,3)) %>% 
+    kable()
+    
+  
+}
+```
+
+
+```{r}
+outcome_col = params$outcome_col_name
+
+### determining the outcome accodring to the followup window
+fwp_window = params$fwp_window
+df = df %>% 
+ print_total("before asserting a minimal fwp window ") %>%
+ filter(days_to_end_of_fwp >= fwp_window) %>% 
+ print_total("after asserting a minimal fwp window ") %>%
+ mutate (days_to_outcome    = as.numeric(difftime(!!sym(outcome_col), index_date,       units = "days"))) %>%
+ filter (is.na(days_to_outcome) | days_to_outcome >= 0) %>%
+ print_total("after filtering outcome events occuring before index_date ") %>% 
+ mutate(sw_outcome = case_when(between(days_to_outcome, 0 ,  fwp_window) ~ 1, T ~0))
+```
+
+
+```{r}
+hist(df$days_to_outcome)
+```
+
+```{r}
+df %>% 
+  filter(is.na(bmi)) %>% 
+  count() %>% 
+  print_total("entries with missing bmi")  
+```
+
+
+
+
+### outcome events
+```{r}
+table(df$sw_outcome)
+```
+```{r loess curve for age, warning=FALSE}
+if (params$plot_hists == 1) {
+  span = 0.2
+  tmp = df %>% 
+    slice_sample(n=55000)
+  plot(tmp$age  ,predict(loess(sw_outcome ~ age,tmp, span=span)),ylab='P(severe covid19)', xlab='Age (years)',
+       main = sprintf('loess curves with span=%.1f', span))
+
+}
+```
+
+
+
+```{r loess curve for count_hosp, warning=FALSE}
+if (params$plot_hists == 1) {
+  span = 0.4
+  tmp = df %>% 
+    slice_sample(n=100000)
+  plot(tmp$pn_count_hosp,predict(loess(sw_outcome ~ pn_count_hosp,tmp, span=span)),ylab='P(severe covid19)', xlab='pn_count_hosp',
+       main = sprintf('loess curves with span=%.1f', span))
+}
+```
+```{r}
+colnames(df)
+max(df$first_time_severe, na.rm = T)
+```
+
+
+```{r eval=FALSE, include=FALSE}
+
+df %>% 
+  group_by(days_to_outcome) %>% 
+  count()
+```
+
+```{r months from variables}
+df = df %>%
+  mutate(days_from_last_vac_dose = pmin(days_from_dose_2,days_from_dose_3,days_from_dose_4, na.rm =T)) %>% 
+  mutate(months_from_last_vac_dose =  ceil(days_from_last_vac_dose/30.0)) %>% 
+  mutate (months_from_last_vac_dose_cat = case_when(  
+                              between(months_from_last_vac_dose, 1, 6)  ~ as.character('1_6'),
+                              between(months_from_last_vac_dose, 7, 10)  ~ as.character('7_10'),
+                                  months_from_last_vac_dose >= 11 ~ as.character('11plus') ,
+                              T ~  as.character('unvacc'))) %>% 
+  mutate (months_from_last_vac_dose_cat = fct_relevel(months_from_last_vac_dose_cat, 'unvacc','1_6', '7_10', '11plus')) %>%
+  mutate(months_from_2nd_dose = round(days_from_dose_2/30.0)) %>% 
+  mutate(months_from_2nd_dose_cat = case_when(
+                                    between(months_from_2nd_dose, 0, 3) ~ as.character('0_3'),
+                                    between(months_from_2nd_dose, 4, 5) ~ as.character('4_5'),
+                                    months_from_2nd_dose >= 6 ~ as.character('6plus'),
+                                    T ~ as.character('unvacc'))) %>% 
+  mutate (months_from_2nd_dose_cat = fct_relevel(months_from_2nd_dose_cat, 'unvacc','0_3','4_5','6plus')) %>%
+  # Note as of this modeling time (Jan 2022) there are not enough people with more than 6 months from 3rd dose
+  mutate(months_from_3rd_dose = round(days_from_dose_3/30.0)) %>% 
+  mutate(months_from_3rd_dose_cat = case_when(
+                                    between(months_from_3rd_dose, 0, 1) ~ as.character('0_1'),
+                                    between(months_from_3rd_dose, 2, 3) ~ as.character('2_3'),
+                                    months_from_3rd_dose >= 4 ~ as.character('4plus'),
+                                    T ~ as.character('unvacc'))) %>% 
+  mutate (months_from_3rd_dose_cat = fct_relevel(months_from_3rd_dose_cat, 'unvacc','0_1', '2_3','4plus')) %>%
+  
+  mutate(days_from_prev_infection = as.numeric(difftime(index_date, previous_infection_date, units = "days"))) %>% 
+  mutate(months_from_prev_infection = round(days_from_prev_infection/30.0)) %>% 
+  mutate (months_from_prev_infection_cat = case_when(  
+            between(months_from_prev_infection, 1, 5) ~ as.character('1_5'),
+            between(months_from_prev_infection, 6, 8) ~ as.character('6_8'),
+            between(months_from_prev_infection, 9, 11) ~ as.character('9_11'),
+            between(months_from_prev_infection, 12, 14) ~ as.character('12_14'),
+            months_from_prev_infection >= 15 ~ as.character('15plus') ,
+            T ~  as.character('None'))) %>% 
+  mutate (months_from_prev_infection_cat = fct_relevel(months_from_prev_infection_cat, 'None','1_5', '6_8','9_11','12_14','15plus')) %>% 
+  mutate(days_from_last_immune_challenge = pmin(days_from_dose_2, days_from_dose_3,days_from_dose_4, days_from_prev_infection, na.rm = T)) %>% 
+  mutate(months_from_last_immune_challenge =  ceil(days_from_last_immune_challenge/30.0)) %>% 
+  mutate (months_from_last_immune_challenge_cat = case_when(  
+                              between(months_from_last_immune_challenge, 1, 4) ~ as.character('1_4'),
+                              between(months_from_last_immune_challenge, 5, 6) ~ as.character('5_6'),
+                                  months_from_last_immune_challenge >= 7 ~ as.character('7plus') ,
+                              T ~  as.character('unvacc'))) %>% 
+  mutate (months_from_last_immune_challenge_cat = fct_relevel(months_from_last_immune_challenge_cat, 'unvacc','1_4', '5_6', '7plus')) %>%
+  mutate(days_from_last_dose = pmin(days_from_dose_2, days_from_dose_3, na.rm = T)) %>% 
+  mutate(waned_immunity2 =  case_when((num_vacc_doses >=2 | sw_previous_infection == 1) & between(days_from_last_immune_challenge , 7, 150) ~ 0, T ~ 1)) %>%
+  mutate(waned_immunity = case_when(num_vacc_doses >=2  & between(days_from_last_dose , 7, 150) ~ 0,                                                                      T                                      ~ 1)) %>% 
+  mutate(recent_immunity = 1-waned_immunity2)
+```
+
+
+```{r eval=FALSE, include=FALSE}
+manual = df %>%
+  select(contains('date'), contains('immune_challenge'), contains('doses'), -contains('corona'), -retrieval_date)
+
+describe(manual)
+```
+
+
+```{r}
+df = df %>% 
+ mutate(age_group = case_when(
+    between(age, 0, 17) ~  "0_17",
+    between(age, 18, 29) ~ "18_29",
+    between(age, 30, 39) ~ "30_39",
+    between(age, 40, 44) ~ "40_44",
+    between(age, 45, 49) ~ "45_49",
+    between(age, 50, 54) ~ "50_54",
+    between(age, 55, 59) ~ "55_59",
+    between(age, 60, 64) ~ "60_64",
+    between(age, 65, 69) ~ "65_69",
+    between(age, 70, 74) ~ "70_74",
+    between(age, 75, 79) ~ "75_79",
+    between(age, 80, 84) ~ "80_84",
+    between(age, 85, 89) ~ "85_89",
+    age >= 90 ~ "90plus")) %>% 
+mutate(age_group10 = case_when(
+    between(age, 0, 17) ~  "bug",
+    between(age, 18, 29) ~ "18_29",
+    between(age, 30, 39) ~ "30_39",
+    between(age, 40, 49) ~ "40_49",
+    between(age, 50, 59) ~ "50_59",
+    between(age, 60, 69) ~ "60_69",
+    between(age, 70, 79) ~ "70_79",
+    age >= 80 ~ "80plus")) %>% 
+  mutate(num_vacc_doses_numeric = num_vacc_doses) %>% 
+  mutate(num_vacc_doses = as.factor(num_vacc_doses)) %>% 
+  mutate (num_vacc_doses = fct_relevel(num_vacc_doses, '0','1', '2','3')) %>%  # 4th dose will also exist as last
+  mutate(vaccination_status = case_when(num_vacc_doses_numeric <2 ~ as.character(num_vacc_doses_numeric),
+                                        num_vacc_doses_numeric >=2 ~ '2plus')) %>% 
+  mutate (vaccination_status =fct_relevel(vaccination_status, '0','1', '2plus')) %>%  
+ mutate(bmi_30plus = case_when(bmi >= 30 ~ 1, T ~ 0)) # Note missing BMI values will be implicitly imputed to 0
+
+  
+```
+
+
+```{r}
+df = df %>% 
+ mutate(count_hosp_cat = case_when(
+    between(pn_count_hosp, 0, 0) ~  "0",
+    between(pn_count_hosp, 1,2) ~  "1_2",
+    between(pn_count_hosp, 3, 5) ~ "3_5",
+    between(pn_count_hosp, 6, 99999) ~ "6plus"))
+
+  
+```
+
+
+
+
+
+```{r missing values bmi, eval=FALSE, include=FALSE}
+void = df %>% 
+  print_total( "WITH entries with missing BMI") %>% 
+  filter(!is.na(bmi)) %>%
+  print_total( "WITHOUT entries with missing BMI") 
+```
+### report smoking Missing Values Stats
+```{r missing values smoking}  
+void = df %>% 
+  print_total( "WITH entries with smoking status") %>% 
+  filter(!is.na(pc_smoke_desc)) %>% 
+  print_total( "WITHOUT entries with missing smoking status")
+```
+
+
+
+
+```{r applying complete cases on BMI and smoking, eval=FALSE, include=FALSE}
+if (params$filter_missing_bmi ==1) {
+df = df %>% 
+  filter(!is.na(bmi)) %>%
+  print_total( "after removing entries with missing BMI") 
+} else {
+    print_total( "entires with missing BMI is not filtered. (for obesity, will be assumed as 0 )") 
+  df = df
+}
+```
+
+
+### outcome events after filtering missing BMI
+```{r}
+table(df$sw_outcome)
+```
+
+```{r eval=FALSE, include=FALSE}
+df %>% 
+  select(age_group,htn,sw_outcome) %>% 
+  group_by(age_group,htn) %>% 
+  summarise(count=n(),risk =mean(sw_outcome))
+```
+
+```{r}
+df = df %>% 
+  mutate(respiratory = case_when(asthma == 1 | other_resp == 1 ~ 1, T ~ 0)) %>% 
+  mutate(age_over_40 = case_when(age<40 ~0, T ~ age-40))
+```
+```{r eval=FALSE, include=FALSE}
+tmp = df %>% 
+  select(sw_previous_infection, sex,age,heart,,preg,overweight,obese,severe_obese,
+                    sickle, thalasamia, diabetes, respiratory, liver, copd, immunosuppression, waned_immunity, num_vacc_doses_numeric, sw_outcome)
+    
+Hmisc::rcorr(as.matrix(tmp), type="pearson")
+  
+```
+```{r eval=FALSE, include=FALSE}
+describe(df)
+```
+
+
+
+
+
+# Table1
+#### Initial population stratified by outcome
+```{r table1, echo=FALSE}
+if (params$create_tables==1) {
+  table1 = tbl_summary(
+      df %>% select(age_group10, sex, bmi_30plus,active_cancer, ckd, diabetes,  heart,neuro,liver, copd, immunosuppression,  count_hosp_cat,  months_from_last_vac_dose_cat, sw_previous_infection, sw_outcome),
+      by = 'sw_outcome',
+      label = list(age_group10 ~ "Age group",
+                 sex ~ "Sex",   
+                 bmi_30plus ~ "Obesity",
+                 active_cancer ~"Active cancer",
+                 heart ~ "Heart disease",
+                 diabetes ~ "Diabetes",
+                 neuro ~ "Neurological disease",
+                 liver ~ "Liver disease",
+                 count_hosp_cat ~ "3 prior years hospitalization count",
+                 months_from_last_vac_dose_cat ~ "Months from last vaccination dose",
+                 sw_previous_infection ~ "Previous infection"
+                 ),
+      statistic = all_continuous() ~ "{mean} ({sd}), {median} ({p25},{p75})",
+      missing = "ifany", # don't list missing data separately
+    ) %>%
+      modify_header(label = "**Variable**") %>% # update the column header
+      bold_labels() %>% 
+      modify_header(all_stat_cols() ~ "**{ifelse(level==0,'Non Severe Outcome','Severe Outcome')}**, N = {n} ({style_percent(p, symbol = TRUE)})") %>% 
+      add_overall() 
+
+table1 %>% 
+    gtsummary::as_flex_table() %>% 
+    save_as_docx(path= glue("points_model_table1.docx"))
+table1
+}
+
+
+```
+
+
+# fit model
+
+
+```{r}
+df = df %>% 
+    mutate(rowid = row_number()) %>% 
+  dummy_cols(select_columns = c( 'sex','num_vacc_doses','vaccination_status',  'count_hosp_cat','months_from_last_immune_challenge_cat','months_from_last_vac_dose_cat', 'months_from_prev_infection_cat', 'age_group','age_group10'), remove_first_dummy = TRUE) %>% 
+  mutate(age_div_2 = round(age/2.0)) 
+
+data_train = df %>% 
+        slice_sample(prop = params$train_prop)
+
+data_test = df %>% anti_join(data_train, by='rowid')
+```
+
+As evidence for the determinism of the slice_sample, using a set.seed():
+```{r}
+sum(data_train$rowid)
+```
+
+```{r}
+write_feather(data_train, glue("feathers/data_train.feather"))
+write_feather(data_test, glue("feathers/data_test.feather"))
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+predictors = c("age_group10_30_39","age_group10_40_49",
+"age_group10_50_59",
+"age_group10_60_69",
+"age_group10_70_79",
+"age_group10_80plus","bmi_30plus", "active_cancer","ckd","diabetes", "heart", "neuro","liver","copd", "immunosuppression",
+"count_hosp_cat_1_2","count_hosp_cat_3_5",  "count_hosp_cat_6plus")
+
+formula = reformulate(termlabels = predictors,intercept = TRUE, response = 'sw_outcome' )
+Reduce(paste, deparse(formula))
+
+
+```
+# Missing values status
+```{r}
+  df %>%
+  select(age_group10, bmi_30plus,active_cancer, ckd, diabetes,  heart,neuro,liver, copd, immunosuppression,  count_hosp_cat,  months_from_last_vac_dose_cat, sw_previous_infection, sw_outcome) %>% 
+  summarize_all(funs(sum(is.na(.)))) %>% 
+  pivot_longer(everything(), names_to = "var", values_to = "count") %>% 
+  filter(count>0) %>% 
+  arrange(desc(count))
+```
+
+```{r manual interactions, eval=FALSE, include=FALSE}
+formula_interaction = sw_outcome ~ age_group_19_29 + age_group_30_39 + age_group_40_49 +      age_group_50_59 + age_group_60_69 + age_group_70_79 + age_group_80plus +      sw_previous_infection + active_cancer + sex_M + ckd + overweight +      obese + severe_obese + preg + thalasamia + diabetes + respiratory +      htn + neuro + liver + heart + copd + immunosuppression +      pn_count_hosp + months_from_last_immune_challenge_cat * num_vacc_doses
+
+```
+
+```{r eval=FALSE, include=FALSE}
+data_test %>% count()
+describe(data_train %>% select(all_of(predictors)))
+```
+
+# Colineraity check via alias()
+```{r eval=FALSE, include=FALSE}
+ res = alias(glm(formula ,data = data_train), partial=T)
+ res
+```
+
+# VIF
+```{r}
+if (length(predictors) > 2) 
+  car::vif(lm(formula ,data = data_train)) %>% kable()
+```
+# GLM
+
+predictors = `r predictors`
+```{r glm, echo=FALSE, message=FALSE, warning=FALSE}
+glm_fit = glm(formula, data = data_train, family = "binomial", control=glm.control(maxit=50))
+```
+
+
+```{r include=FALSE}
+save(glm_fit, file = "glm_fit.rda")
+write_feather(df, glue("feathers/final_df_{params$input_table}.feather"))
+```
+
+```{r echo=FALSE}
+ summary(glm_fit)
+```
+
+```{r broom_tidy, message=FALSE, warning=FALSE}
+if (params$calc_broom_fit_ci ==1) {
+  tidy_fit = broom::tidy(glm_fit, conf.int=T) %>% 
+    print_total("after broom tidy") %>% 
+    dplyr::mutate(OR  = estimate, `OR 95% Low` = conf.low, `OR 95% High` = conf.high ) %>% 
+    dplyr::mutate(OR  = estimate, `estimate 95% Low` = conf.low, `estimate 95% High` = conf.high ) %>% 
+    dplyr::mutate(across(c("OR","OR 95% Low","OR 95% High"), exp)) %>% 
+    dplyr::mutate(across(c("OR","OR 95% Low","OR 95% High"),  ~round(.x, 3))) %>% 
+    dplyr::mutate(across(c("estimate","estimate 95% Low","estimate 95% High"),  ~round(.x, 3))) %>% 
+    dplyr::mutate(across(c("p.value"), ~round(.x, 5))) %>% 
+  select(term, contains('estimate'),p.value, contains('OR') )
+
+} else {
+  tidy_fit = broom::tidy(glm_fit, conf.int=F) %>% 
+    dplyr::mutate(exp_estimate = exp(estimate)) %>% 
+    dplyr::mutate(across(c("estimate", "exp_estimate"), ~round(.x, 2))) %>% 
+    dplyr::mutate(p.value = round(p.value,5)) %>% 
+  select(term, estimate, exp_estimate,p.value)  
+  
+}
+write.csv(tidy_fit, "logistic_regression_model.csv")
+
+tidy_fit %>% kable()
+```
+
+

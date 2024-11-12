@@ -1,0 +1,205 @@
+---
+title: Points Model 2022 Evaluation BOOTSTRAPPING plots
+output: 
+  html_document:
+    toc: false
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+date: "`r format(Sys.time(), '%H:%M %d %B %Y')`"
+params:
+  outcome_col_name: first_time_severe
+  plot_hists: 0
+  sanity_tests: 1
+  seed: 2013
+  debug_mode: 1
+  train_prop: 0.8
+  simp_factor: 3
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(tidyverse)
+library(patchwork)
+library(ggforce)
+source('functions.R')
+```
+
+
+
+```{r}
+#----------------------------------------------------------------
+folder = glue("./Results/boot500")
+#----------------------------------------------------------------
+```
+
+
+```{r}
+
+
+# risk percentiles data frames 
+glm_metrics_by_risk_ptile                    = read.csv(glue("{folder}/glm_metrics_by_risk_ptile.csv"))
+points_model_metrics_by_risk_ptile           = read.csv(glue("{folder}/points_model_metrics_by_risk_ptile"))
+shirnked_points_model_metrics_by_risk_ptile  = read.csv(glue("{folder}/shirnked_points_model_metrics_by_risk_ptile"))
+
+# risk scores data frames 
+points_model_metrics_by_score                = read.csv(glue("{folder}/points_model_metrics_by_score"))
+shrinked_points_model_metrics_by_score       = read.csv(glue("{folder}/shrinked_points_model_metrics_by_score"))
+
+```
+
+```{r}
+
+# for LIFT
+generate_points_model_metric_plot_lift = function(df, model_name, metric_name, metric_col, lower_col, upper_col, xlim, ylim, color ) {
+  colors_map = c("metric" = color)
+  color_labels  = c(metric_name, "%Population above threshold")
+  p = ggplot(data = df,aes(x = risk_points)) + 
+      geom_line(aes(y = {{metric_col}} , colour = "metric")) +
+      geom_ribbon(data = df, aes(x = risk_points, ymin={{lower_col}},ymax={{upper_col}}, fill  = 'metric'),alpha=0.1)+
+      scale_colour_manual(values = colors_map, labels  = color_labels, guide=guide_legend(title="")) +
+      scale_fill_manual(values = colors_map, labels  = color_labels, guide="none")+
+      guides(color = "none", fill ="none") + 
+      scale_x_continuous(breaks = seq(0,xlim[[2]], by=2), limits=xlim)+
+      coord_cartesian(xlim=xlim, ylim =ylim) +
+      scale_y_continuous(labels = function(x) {glue("{x}")} )+
+      theme_bw() +
+      theme(text = element_text(size=16)) +
+      labs(x="Risk Points Threshold", y=metric_name, title=glue("{model_name}: {metric_name} With 95% Confidence Intervals ")) 
+    
+  ggsave(glue("{folder}/{metric_name}_{model_name}.png"), print(p), width=15, height = 10)
+  p
+}
+
+# for PPV + SENSETIVITY + % pop above
+generate_points_model_metric_plot = function(df, model_name, metric_name, title_suffix, metric_col, lower_col, upper_col, xlim, ylim, color ) {
+  colors_map = c("metric" = color)
+  color_labels  = c(metric_name, "%Population above threshold")
+  p = ggplot(data = df,aes(x = risk_points)) + 
+      geom_line(aes(y = {{metric_col}}*100 , colour = "metric")) +
+      geom_ribbon(data = df, aes(x = risk_points, ymin={{lower_col}}*100,ymax={{upper_col}}*100, fill  = 'metric'),alpha=0.1)+
+      scale_colour_manual(values = colors_map, labels  = color_labels, guide=guide_legend(title="")) +
+      scale_fill_manual(values = colors_map, labels  = color_labels, guide="none")+
+      guides(color = "none", fill ="none") + 
+      scale_x_continuous(breaks = seq(0,xlim[[2]], by=2), limits=xlim)+
+      coord_cartesian(xlim=xlim, ylim =ylim) +
+      scale_y_continuous(labels = function(x) {glue("{x}%")} )+
+      theme_bw() +
+      theme(text = element_text(size=16)) +
+      labs(x="Risk Points Threshold", y=metric_name, title=glue("{model_name}: {metric_name} {title_suffix}")) 
+  cleaned_metric_name = stringr::str_replace(metric_name, "%", "pct")
+  ggsave(glue("{folder}/{cleaned_metric_name}_{model_name}.png"), print(p), width=15, height = 10)
+  p
+}
+
+
+
+```
+
+```{r}
+  xlim = c(0,73)
+  model_name = "Granular Points Model"
+  lift_granular = generate_points_model_metric_plot_lift(points_model_metrics_by_score, model_name, glue("Lift"),
+                                                         estimate_Lift,lower_Lift,upper_Lift, xlim = xlim, ylim=c(1,250), color="red")
+  sens_granular = generate_points_model_metric_plot(points_model_metrics_by_score, model_name, "Sensitivity","With 95% Confidence Intervals",
+                                              estimate_Sensitivity,lower_Sensitivity,upper_Sensitivity, xlim = xlim, ylim=c(0,100), color="red")
+  
+  ppv_granular = generate_points_model_metric_plot(points_model_metrics_by_score, model_name, "PPV" ,"With 95% Confidence Intervals",
+                                                   estimate_PPV,lower_PPV,upper_PPV, xlim = xlim, ylim=c(0,100), color= "red")
+  
+  ppcr_granular = generate_points_model_metric_plot(points_model_metrics_by_score, model_name, "% population above threshold", "", estimate_ppcr,
+                                                    lower_ppcr,upper_ppcr, xlim = xlim, ylim=c(0,100), color= "red")
+  
+
+  xlim = c(0,26)
+  model_name = "Simplified Points Model"
+  lift_simplified = generate_points_model_metric_plot_lift(shrinked_points_model_metrics_by_score, model_name, glue("Lift"),
+                                                 estimate_Lift,lower_Lift,upper_Lift, xlim = xlim, ylim=c(1,250), color="blue")
+  
+  sens_simplified = generate_points_model_metric_plot(shrinked_points_model_metrics_by_score, model_name, "Sensitivity","With 95% Confidence Intervals",
+                                            estimate_Sensitivity,lower_Sensitivity,upper_Sensitivity, xlim = xlim, ylim=c(0,100), color="blue")
+  ppv_simplified = generate_points_model_metric_plot(shrinked_points_model_metrics_by_score, model_name, "PPV" ,"With 95% Confidence Intervals",
+                                                     estimate_PPV,lower_PPV,upper_PPV,xlim = xlim, ylim=c(0,100), color="blue")
+
+  ppcr_simplified = generate_points_model_metric_plot(shrinked_points_model_metrics_by_score, model_name, "% population above threshold", "",
+                                                    estimate_ppcr,lower_ppcr,upper_ppcr,xlim = xlim, ylim=c(0,100), color="blue")
+
+```
+
+
+```{r fout.width ='85%'}
+risk_points_grid = (lift_granular / ppv_granular / sens_granular / ppcr_granular) | (lift_simplified / ppv_simplified /  sens_simplified / ppcr_simplified)
+ggsave(glue("{folder}/__grid__risk_points.png"), print(risk_points_grid), width=30, height = 20)
+
+```
+
+```{r}
+
+generate_risk_ptl_metric_plot = function(metric_name, pe_col, lower_col, upper_col, xlim, ylim , zoom_xlim = NULL, zoom_ylim = NULL,  y_as_percent = TRUE, fig_width = 6, fig_height = 5) {
+colors_map = c("baseline" = "red", "Shrinkage" = "blue", "glm" = "green")
+color_labels  = c("baseline" = "Granular Points Model", "Shrinkage" = "Simplified Points Model", "glm" = "Underlying Logistic Reg.")
+p = ggplot() + 
+    scale_colour_manual(values = colors_map, labels  = color_labels, guide=guide_legend(title="Model"),breaks = c("glm", "baseline", "Shrinkage")) +
+    scale_fill_manual(values = colors_map,   labels  = color_labels, guide="none",                    )+
+    scale_x_continuous(breaks = seq(xlim[1],xlim[2], by=5))+
+    xlim(xlim) + ylim(ylim)+
+    theme_bw() +
+    theme(text = element_text(size=14))+
+    labs(x="Risk Percentile", y=glue("{metric_name}"), title=glue("{metric_name} With Boostrap Based 95% Confidence Intervals")) +
+    # --------------- shrinked points model-------------------------------------
+    geom_line(data = shirnked_points_model_metrics_by_risk_ptile, mapping = aes(x = risk_percentile, y = {{pe_col}} , colour = 'Shrinkage')) +
+    geom_ribbon(data = shirnked_points_model_metrics_by_risk_ptile, aes(x = risk_percentile, ymin={{lower_col}},ymax={{upper_col}}, fill  = 'Shrinkage'),alpha=0.1)+
+    # --------------- baseline points model-------------------------------------
+    geom_line(data = points_model_metrics_by_risk_ptile, mapping = aes(x = risk_percentile,y = {{pe_col}} , colour = 'baseline')) +
+    geom_ribbon(data = points_model_metrics_by_risk_ptile, aes(x = risk_percentile, ymin={{lower_col}},ymax={{upper_col}}, fill  = 'baseline'),alpha=0.1) +
+    # --------------- glm model-------------------------------------
+    geom_line(data = glm_metrics_by_risk_ptile, mapping = aes(x = risk_percentile, y = {{pe_col}} , colour = 'glm')) +
+    geom_ribbon(data = glm_metrics_by_risk_ptile, aes(x = risk_percentile, ymin={{lower_col}},ymax={{upper_col}}, fill  = 'glm'),alpha=0.1) 
+if (!is.null(zoom_xlim) | !is.null(zoom_ylim))
+  p = p + facet_zoom(xlim = zoom_xlim, ylim= zoom_ylim, horizontal = F)
+
+  if (y_as_percent)
+    p = p + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+  
+  ggsave(glue("{folder}/{metric_name}.png"), print(p), width=fig_width, height = fig_height)
+  p
+}
+#
+```
+
+```{r}
+risk_ptl_start = 50
+fig_width = 7
+fig_height = 7
+```
+```{r Lift,    fig.width = fig_width, fig.height = fig_height}
+lift_risk_ptile = generate_risk_ptl_metric_plot("Lift", estimate_Lift,lower_Lift,upper_Lift, xlim = c(risk_ptl_start,101),ylim=c(1,55),y_as_percent = F, zoom_xlim = c(95,99.2))
+```
+
+```{r PPV,    fig.width = fig_width, fig.height = fig_height}
+ppv_risk_ptile = generate_risk_ptl_metric_plot("PPV", estimate_PPV,lower_PPV,upper_PPV,xlim = c(risk_ptl_start, 101), ylim=c(0,.5), zoom_xlim = c(97,100),zoom_ylim=c(0,.36))
+```
+
+```{r sensitivity,  fig.width = fig_width, fig.height = fig_height}
+sens_risk_ptile = generate_risk_ptl_metric_plot("Sensitivity", estimate_Sensitivity,lower_Sensitivity,upper_Sensitivity, xlim = c(risk_ptl_start,100),ylim=c(0.5,1),
+                                                zoom_xlim = c(92,100),zoom_ylim=NULL)
+
+```
+
+
+
+
+
+```{r}
+grid_risk_ptile = (lift_risk_ptile / ppv_risk_ptile / sens_risk_ptile) 
+ggsave(glue("{folder}/__grid__risk_percentile.png"), print(grid_risk_ptile), width=10, height = 20)
+
+```
+```{r}
+
+```
+
+

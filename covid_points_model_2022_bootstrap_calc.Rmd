@@ -1,0 +1,226 @@
+---
+title: Points Model 2022 Evaluation BOOTSTRAPPING
+output: 
+  html_document:
+    toc: false
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+date: "`r format(Sys.time(), '%H:%M %d %B %Y')`"
+params:
+  outcome_col_name: first_time_severe
+  plot_hists: 0
+  sanity_tests: 1
+  seed: 2013
+  debug_mode: 1
+  train_prop: 0.8
+  simp_factor: 3
+
+---
+
+## parameters:
+  * outcome columns =  `r params$outcome_col_name`\
+  * outcome = `r ifelse (params$outcome_col_name == 'first_time_severe' , 'Severe or Death', 'Hospitalizaiton')` 
+  * train_prop = `r params$train_prop`\ 
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+library(plyr)
+library(RODBC)
+library(mgcv)
+library(gtsummary)
+library(ggplot2)
+library(MatchIt)
+library(Hmisc)
+library(readxl)
+library(glue)
+library(dplyr)
+library(feather)
+library(cobalt)
+library(knitr)
+library(cri.utils)
+library(lubridate)
+library(jtools)
+library(flextable)
+library(formula.tools)
+library(fastDummies) # to create dummy columns
+library(pROC)
+library(boot)
+library(parallel)
+library(pbmcapply)
+library(scales)
+library(tidyverse)
+source('functions.R')
+
+```
+
+
+```{r include=FALSE}
+options(scipen = 999)
+activate_keytab("yatirbe")
+set.seed(params$seed)
+```
+
+
+```{r read data}
+load(file = "glm_fit.rda")
+data_train = read_feather("feathers/data_train.feather")
+data_test  = read_feather("feathers/data_test.feather")
+```
+### observations in the train_set: `r nrow(data_train)`
+### observations in the test_set: `r nrow(data_test)`
+```{r}
+ref_var = get_normalization_factor(glm_fit)
+if (normalization_factor == 0) {
+    normalization_factor = ref_var[[2]]
+}
+```
+
+#### multiplying all coefficients by 1/`r normalization_factor` 
+## this normalization factor is `r ifelse(normalization_factor > 0,  '!!!! Manual !!!!', 'Automatic calculated a reference variable')` 
+reference variable: `r ref_var[[1]]`
+
+```{r}
+# 1. Full model
+raw_scores = get_scores(glm_fit, ref_var_value = 1.0,
+                        simplification_factor = 1.0,
+                        normalization_factor = normalization_factor)
+                      
+# simplified model
+simplified_scores = get_scores(glm_fit, ref_var_value = 1.0,
+                        simplification_factor = 3.0, 
+                        normalization_factor = normalization_factor)
+```
+
+## Raw Scores
+```{r}
+raw_scores %>% kable()
+```
+
+## Shrinked Scores
+```{r}
+simplified_scores %>% kable()
+```
+
+```{r}
+# -------------------------------------------------------------------------------
+one_bootstrap_iteration = function(i, df, glm_fit, scores, metrics_function, sample = TRUE, score_capping_quantiile ) {
+# -------------------------------------------------------------------------------
+  print (glue("{i},{sample},{nrow(df)}"))
+  if (sample) { 
+    boot_data = slice_sample(df,n=nrow(df), replace=T)
+  } else {
+    boot_data = df
+  }
+  # calculate metrics per threshold
+  full_metrics = metrics_function(boot_data, FALSE, glm_fit, scores, n_digits =3, score_capping_quantiile =score_capping_quantiile)
+  #write.csv(full_metrics, glue("./debug/metrics{i}.csv"))
+  results = full_metrics %>% 
+    select (contains('ppcr'), contains('points'), Sensitivity, PPV,Lift, contains('positives')) %>% # note only one of points, ppcr will exist in the DF depending on flow
+    mutate(iteration=i)
+ 
+  results
+}
+
+
+
+# idx: 1 = lower CI bound, 2 = upper CI bound
+# -------------------------------------------------------------------------------
+calc_boot_ci = function(values, idx) {
+# -------------------------------------------------------------------------------
+  #write_lines(values, "./debug/values.txt", append =F)
+  values = values[!is.na(values)]
+  #write_lines(values, "./debug/values_cln.txt", append =F)
+  if (length(values) == 0) {
+    return(NA)
+  }
+  if (min(values) == max(values)) {
+    #write_lines(c("zero variance"), "myFile.txt", append =T)
+    return (min(values))
+  }
+  ci = rms::bootBCa(estimate = NA,
+                     estimates = values,
+                     type = "percentile",
+                     n =length(values),
+                     seed = 123)
+  ci[idx]
+
+}
+```
+
+```{r}
+# -------------------------------------------------------------------------------
+run_bootsraps = function(num_bootsrap_reps, df, glm_fit, scores, metrics_function, model_name, x_axis, score_capping_quantiile = 1.0) {
+# -------------------------------------------------------------------------------
+  # estimate
+  #full_estimation = one_bootstrap_iteration(i = 1, df = df, glm_fit = glm_fit, sample = FALSE)
+  metrics = c("Sensitivity", "PPV","Lift", "ppcr", "predicted_positives")
+  boosstrap_results = bind_rows(
+    pbmclapply(X = 1:num_bootsrap_reps, FUN = one_bootstrap_iteration, df, glm_fit, scores, metrics_function, sample=TRUE, score_capping_quantiile = score_capping_quantiile, mc.cores = 48) )
+  boosstrap_results = boosstrap_results %>% 
+    mutate(x_axis = {{x_axis}}) %>% 
+    filter(x_axis > 0) %>% 
+    mutate(x_axis = round(x_axis,5)) 
+
+  point_estimate = boosstrap_results %>%
+    group_by(x_axis) %>% 
+    dplyr::summarise(across(metrics , function(.x) quantile(.x, 0.5, na.rm = T), .names = "estimate_{.col}"))
+  
+  lower_bounds =  boosstrap_results %>%
+    group_by(x_axis) %>% 
+    dplyr::summarise(across(metrics , ~calc_boot_ci(.x, 1), .names = "lower_{.col}"))  
+  
+  upper_bounds =  boosstrap_results %>%
+    group_by(x_axis) %>% 
+    dplyr::summarise(across(metrics , ~calc_boot_ci(.x, 2), .names = "upper_{.col}"))  
+
+# Combine all 
+  lower_bounds %>%
+      full_join(upper_bounds, by="x_axis") %>% 
+      full_join(point_estimate, by="x_axis") %>% 
+      select(x_axis, contains('PPV'), contains('Sens'), contains('Lift'), contains('N'), contains('predicted_positives'), contains('ppcr')) %>% 
+      mutate(across(everything(), ~round(.x, 5))) %>% 
+      mutate(risk_points = x_axis)  %>%
+      mutate(x_axis =  100*(x_axis)) %>% 
+      mutate(risk_percentile = 100-x_axis) %>% 
+      mutate(ppcr = 1-estimate_ppcr)
+      
+}
+
+```
+
+```{r actual boostrap}
+num_iterations = 500
+glm_metrics_by_risk_ptile                   = run_bootsraps(num_iterations, data_test, glm_fit, NULL, get_rtichoke_performance_table, "glm",
+                                                            ppcr, NA)
+points_model_metrics_by_risk_ptile          = run_bootsraps(num_iterations, data_test, glm_fit, raw_scores,     
+                                                            get_rtichoke_performance_table, "points_model",          ppcr, NA)
+shirnked_points_model_metrics_by_risk_ptile = run_bootsraps(num_iterations, data_test, glm_fit, simplified_scores,
+                                                            get_rtichoke_performance_table, "points_model_shirnkage",ppcr, NA )
+
+points_model_metrics_by_score          = run_bootsraps(num_iterations, data_test, glm_fit, raw_scores,        calc_metrics, "points_model",    
+                                                       points, 0.99995)
+shrinked_points_model_metrics_by_score = run_bootsraps(num_iterations, data_test, glm_fit, simplified_scores, calc_metrics,
+                                                       "points_model_shirnkage", points, 0.99995)
+```
+
+```{r}
+
+folder = glue("./Results/boot{num_iterations}")
+unlink(folder, recursive = TRUE)
+dir.create(folder, showWarnings = FALSE)
+
+# storing risk percentiles data frames for future usage
+write.csv(glm_metrics_by_risk_ptile,glue("{folder}/glm_metrics_by_risk_ptile.csv"))
+write.csv(points_model_metrics_by_risk_ptile,glue("{folder}/points_model_metrics_by_risk_ptile"))
+write.csv(shirnked_points_model_metrics_by_risk_ptile,glue("{folder}/shirnked_points_model_metrics_by_risk_ptile"))
+
+# storing risk scores data frames for future usage
+write.csv(points_model_metrics_by_score,glue("{folder}/points_model_metrics_by_score"))
+write.csv(shrinked_points_model_metrics_by_score,glue("{folder}/shrinked_points_model_metrics_by_score"))
+
+```
+```{r}
+
+```
+
